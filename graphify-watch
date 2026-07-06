@@ -58,6 +58,25 @@ safe_name() {
   printf '%s' "$1" | tr '/ ' '__' | tr -cd '[:alnum:]_.-'
 }
 
+ensure_graphify_gitignore() {
+  local root="$1" gitignore="$root/.gitignore"
+  if [[ -f "$gitignore" ]] && grep -Eq '^[[:space:]]*graphify-out/?[[:space:]]*$' "$gitignore"; then
+    echo "gitignore already contains graphify-out"
+    return 0
+  fi
+
+  if [[ -f "$gitignore" && -s "$gitignore" ]]; then
+    local last_char
+    last_char="$(tail -c 1 "$gitignore" 2>/dev/null || true)"
+    [[ -n "$last_char" ]] && printf '\n' >> "$gitignore"
+    printf '\n# Graphify output\ngraphify-out/\n' >> "$gitignore"
+  else
+    printf '# Graphify output\ngraphify-out/\n' >> "$gitignore"
+  fi
+  echo "appended graphify-out/ to $gitignore"
+}
+
+
 cmdline_for() {
   local pid="$1"
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
@@ -129,6 +148,7 @@ start_cmd() {
     return 0
   fi
   confirm "Start graphify watcher in $root?" || return 1
+  ensure_graphify_gitignore "$root"
   safe="$(safe_name "$root")"
   started="$(date -Is)"
   log="$STATE_DIR/${safe}.log"

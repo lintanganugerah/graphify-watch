@@ -8,6 +8,7 @@ Detached watcher wrapper for [`graphify`](https://github.com/Graphify-Labs/graph
 
 - runs initial code-only extraction first with `graphify update .`
 - starts `graphify watch .` detached
+- appends `graphify-out/` to `.gitignore` if missing
 - stores watcher registry in `~/.graphify-watch/registry.tsv`
 - writes per-project logs to `~/.graphify-watch/<safe-root>.log`
 - supports `status`, `logs`, `stop`, and `restart` from any directory
@@ -89,6 +90,7 @@ graphify-watch help
 
 ```text
 confirm target path
+append graphify-out/ to .gitignore if missing
 run graphify update .
 run GRAPHIFY_WATCH_POLLING=1 nohup graphify watch .
 record PID/root/log in registry
