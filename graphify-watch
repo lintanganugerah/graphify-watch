@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${GRAPHIFY_WATCH_STATE_DIR:-$HOME/.graphify-watch}"
+REGISTRY="$STATE_DIR/registry.tsv"
+mkdir -p "$STATE_DIR"
+touch "$REGISTRY"
+
+usage() {
+  cat <<'EOF'
+graphify-watch - manage detached graphify watch processes
+
+Usage:
+  graphify-watch start [PATH]
+  graphify-watch stop
+  graphify-watch status
+  graphify-watch logs [PID]
+  graphify-watch restart [PATH]
+  graphify-watch help
+
+Commands:
+  start [PATH]     Start watcher for PATH. Default: current directory.
+  stop             Pick one running watcher, confirm, then stop it. Works from any directory.
+  status           List active/stale watchers from any directory.
+  logs [PID]       Tail log for PID, or pick if PID omitted.
+  restart [PATH]   Stop watcher for PATH if running, then start it again.
+  help             Show this help.
+
+Options:
+  -h, --help       Show command help.
+
+Files:
+  Registry:        ~/.graphify-watch/registry.tsv
+  Logs:            ~/.graphify-watch/<safe-root>.log
+
+Safety:
+  Uses PID + /proc/<pid>/cmdline guard. No pkill. Stop targets one confirmed PID.
+EOF
+}
+
+confirm() {
+  local prompt="$1" answer
+  printf '%s [y/N]: ' "$prompt"
+  read -r answer
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) echo "cancelled"; return 1 ;;
+  esac
+}
+
+abs_path() {
+  local target="${1:-.}"
+  mkdir -p "$target"
+  (cd "$target" && pwd -P)
+}
+
+safe_name() {
+  printf '%s' "$1" | tr '/ ' '__' | tr -cd '[:alnum:]_.-'
+}
+
+cmdline_for() {
+  local pid="$1"
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+}
+
+pid_is_graphify_watch() {
+  local pid="$1" cmd
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(cmdline_for "$pid")"
+  [[ "$cmd" == *"graphify"* && ( "$cmd" == *"--watch"* || "$cmd" == *" watch "* ) ]]
+}
+
+compact_registry() {
+  local tmp="$REGISTRY.tmp"
+  : > "$tmp"
+  while IFS=$'\t' read -r pid root log started; do
+    [[ -n "${pid:-}" ]] || continue
+    if pid_is_graphify_watch "$pid"; then
+      printf '%s\t%s\t%s\t%s\n' "$pid" "$root" "$log" "$started" >> "$tmp"
+    fi
+  done < "$REGISTRY"
+  mv "$tmp" "$REGISTRY"
+}
+
+find_by_root() {
+  local root="$1"
+  while IFS=$'\t' read -r pid r log started; do
+    [[ "$r" == "$root" ]] && pid_is_graphify_watch "$pid" && printf '%s\t%s\t%s\t%s\n' "$pid" "$r" "$log" "$started"
+  done < "$REGISTRY"
+}
+
+list_running() {
+  compact_registry
+  local n=0
+  while IFS=$'\t' read -r pid root log started; do
+    [[ -n "${pid:-}" ]] || continue
+    n=$((n + 1))
+    printf '%d) PID %s | %s | log %s | started %s\n' "$n" "$pid" "$root" "$log" "$started"
+  done < "$REGISTRY"
+  return 0
+}
+
+pick_running() {
+  compact_registry
+  local count choice line
+  count="$(wc -l < "$REGISTRY" | tr -d ' ')"
+  if [[ "$count" == "0" ]]; then
+    echo "no graphify watcher running" >&2
+    return 1
+  fi
+  list_running >&2
+  printf 'Pick watcher number: ' >&2
+  read -r choice
+  [[ "$choice" =~ ^[0-9]+$ ]] || { echo "invalid choice" >&2; return 1; }
+  line="$(sed -n "${choice}p" "$REGISTRY")"
+  [[ -n "$line" ]] || { echo "invalid choice" >&2; return 1; }
+  printf '%s\n' "$line"
+}
+
+start_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; return 0; fi
+  local root existing safe log pid started
+  root="$(abs_path "${1:-.}")"
+  existing="$(find_by_root "$root" || true)"
+  if [[ -n "$existing" ]]; then
+    echo "watcher already running for $root"
+    printf '%s\n' "$existing"
+    return 0
+  fi
+  confirm "Start graphify watcher in $root?" || return 1
+  safe="$(safe_name "$root")"
+  started="$(date -Is)"
+  log="$STATE_DIR/${safe}.log"
+  echo "[graphify-watch] initial code extraction for $root" >> "$log"
+  if ! (cd "$root" && graphify update . >> "$log" 2>&1); then
+    echo "initial code extraction failed; see log: $log" >&2
+    return 1
+  fi
+  pushd "$root" >/dev/null
+  GRAPHIFY_WATCH_POLLING=1 nohup graphify watch . >> "$log" 2>&1 &
+  pid="$!"
+  popd >/dev/null
+  printf '%s\t%s\t%s\t%s\n' "$pid" "$root" "$log" "$started" >> "$REGISTRY"
+  echo "started PID $pid"
+  echo "root: $root"
+  echo "log: $log"
+}
+
+stop_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; return 0; fi
+  local line pid root log started tmp
+  line="$(pick_running)" || return 1
+  IFS=$'\t' read -r pid root log started <<< "$line"
+  confirm "Stop graphify watcher PID $pid in $root?" || return 1
+  if pid_is_graphify_watch "$pid"; then
+    kill "$pid"
+  fi
+  tmp="$REGISTRY.tmp"
+  awk -F '\t' -v p="$pid" '$1 != p' "$REGISTRY" > "$tmp"
+  mv "$tmp" "$REGISTRY"
+  echo "stopped PID $pid"
+}
+
+status_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; return 0; fi
+  if [[ ! -s "$REGISTRY" ]]; then
+    echo "no graphify watcher running"
+    return 0
+  fi
+  list_running
+}
+
+logs_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; return 0; fi
+  local pid="${1:-}" line root log started
+  if [[ -z "$pid" ]]; then
+    line="$(pick_running)" || return 1
+    IFS=$'\t' read -r pid root log started <<< "$line"
+  else
+    line="$(awk -F '\t' -v p="$pid" '$1 == p {print; exit}' "$REGISTRY")"
+    [[ -n "$line" ]] || { echo "PID not found in registry: $pid" >&2; return 1; }
+    IFS=$'\t' read -r pid root log started <<< "$line"
+  fi
+  echo "tailing $log"
+  tail -f "$log"
+}
+
+restart_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; return 0; fi
+  local root existing pid r log started tmp
+  root="$(abs_path "${1:-.}")"
+  existing="$(find_by_root "$root" || true)"
+  if [[ -n "$existing" ]]; then
+    IFS=$'\t' read -r pid r log started <<< "$existing"
+    confirm "Restart graphify watcher PID $pid in $root?" || return 1
+    kill "$pid" 2>/dev/null || true
+    tmp="$REGISTRY.tmp"
+    awk -F '\t' -v p="$pid" '$1 != p' "$REGISTRY" > "$tmp"
+    mv "$tmp" "$REGISTRY"
+  fi
+  start_cmd "$root"
+}
+
+case "${1:-help}" in
+  start) shift; start_cmd "${1:-}" ;;
+  stop) shift; stop_cmd "${1:-}" ;;
+  status) shift; status_cmd "${1:-}" ;;
+  logs) shift; logs_cmd "${1:-}" ;;
+  restart) shift; restart_cmd "${1:-}" ;;
+  help|-h|--help) usage ;;
+  *) echo "unknown command: ${1:-}" >&2; usage; exit 2 ;;
+esac
